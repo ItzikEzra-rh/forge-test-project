@@ -1,9 +1,3 @@
-## Executive Summary
-
-This project implements a GitHub Pull Request-based approval workflow for Product Requirements Documents (PRDs). The system will integrate OAuth2 authentication, API rate limiting, webhook notifications, and a metrics dashboard to provide a complete approval and monitoring solution for PRD review processes.
-
----
-
 ## Problem Statement
 
 ### Current Pain Points
@@ -111,6 +105,32 @@ Enable streamlined, transparent PRD approval workflows through GitHub PR mechani
 
 **FR-2.6:** The system SHALL log rate limit violations for monitoring and analysis.
 
+**FR-2.7:** The system SHALL enforce endpoint-specific rate limits as follows:
+
+**Authentication Endpoints:**
+- `POST /oauth/token` - 20 requests/minute per IP address
+- `POST /oauth/refresh` - 50 requests/hour per client
+- `GET /oauth/authorize` - 30 requests/minute per user
+
+**Read Operations (GET):**
+- `GET /api/v1/prds` - 500 requests/hour per client (Free: 50/hour)
+- `GET /api/v1/prds/:id` - 1,000 requests/hour per client (Free: 100/hour)
+- `GET /api/v1/webhooks` - 200 requests/hour per client (Free: 20/hour)
+- `GET /api/v1/metrics/*` - 300 requests/hour per client (Free: 30/hour)
+
+**Write Operations (POST/PUT/DELETE):**
+- `POST /api/v1/prds` - 100 requests/hour per client (Free: 10/hour)
+- `PUT /api/v1/prds/:id` - 200 requests/hour per client (Free: 20/hour)
+- `POST /api/v1/prds/:id/approve` - 50 requests/hour per client (Free: 10/hour)
+- `POST /api/v1/prds/:id/reject` - 50 requests/hour per client (Free: 10/hour)
+- `POST /api/v1/webhooks` - 20 requests/hour per client (Free: 5/hour)
+- `PUT /api/v1/webhooks/:id` - 50 requests/hour per client (Free: 10/hour)
+- `DELETE /api/v1/webhooks/:id` - 50 requests/hour per client (Free: 10/hour)
+
+**FR-2.8:** Endpoint-specific limits SHALL take precedence over tier-wide limits and SHALL be evaluated independently.
+
+**FR-2.9:** The system SHALL provide a `GET /api/v1/rate-limits` endpoint returning current rate limit status for all endpoints available to the authenticated client.
+
 ### FR-3: Webhook Notifications for Status Changes
 
 **FR-3.1:** The system SHALL send webhook notifications for the following PRD status changes:
@@ -180,6 +200,120 @@ Enable streamlined, transparent PRD approval workflows through GitHub PR mechani
 **FR-4.4:** The system SHALL support exporting metrics as CSV/JSON.
 
 **FR-4.5:** The dashboard SHALL be accessible only to users with `metrics:read` OAuth2 scope.
+
+### FR-5: Error Handling and Retry Mechanisms
+
+**FR-5.1:** The system SHALL implement a unified error handling strategy with standardized error response format:
+```json
+{
+  "error": {
+    "code": "ERROR_CODE",
+    "message": "Human-readable error message",
+    "details": {},
+    "request_id": "unique-request-identifier",
+    "timestamp": "ISO-8601 timestamp"
+  }
+}
+```
+
+**FR-5.2:** The system SHALL return appropriate HTTP status codes for error conditions:
+- `400 Bad Request` - Invalid input or malformed request
+- `401 Unauthorized` - Missing or invalid authentication
+- `403 Forbidden` - Valid authentication but insufficient permissions
+- `404 Not Found` - Resource does not exist
+- `409 Conflict` - Resource state conflict (e.g., duplicate submission)
+- `422 Unprocessable Entity` - Valid syntax but semantic errors
+- `429 Too Many Requests` - Rate limit exceeded
+- `500 Internal Server Error` - Unexpected server error
+- `502 Bad Gateway` - Upstream service failure
+- `503 Service Unavailable` - Temporary service outage
+- `504 Gateway Timeout` - Upstream service timeout
+
+**FR-5.3:** The system SHALL implement the following error code taxonomy:
+- `AUTH_*` - Authentication/authorization errors (e.g., `AUTH_TOKEN_EXPIRED`, `AUTH_INVALID_SCOPE`)
+- `RATE_*` - Rate limiting errors (e.g., `RATE_LIMIT_EXCEEDED`, `RATE_QUOTA_EXHAUSTED`)
+- `VALIDATION_*` - Input validation errors (e.g., `VALIDATION_REQUIRED_FIELD`, `VALIDATION_INVALID_FORMAT`)
+- `RESOURCE_*` - Resource-related errors (e.g., `RESOURCE_NOT_FOUND`, `RESOURCE_CONFLICT`)
+- `WEBHOOK_*` - Webhook delivery errors (e.g., `WEBHOOK_DELIVERY_FAILED`, `WEBHOOK_TIMEOUT`)
+- `GITHUB_*` - GitHub integration errors (e.g., `GITHUB_API_ERROR`, `GITHUB_RATE_LIMIT`)
+- `INTERNAL_*` - Internal system errors (e.g., `INTERNAL_DATABASE_ERROR`, `INTERNAL_SERVICE_ERROR`)
+
+**FR-5.4:** The system SHALL implement retry mechanisms for transient failures:
+
+**Client-Side Retries (API Consumers):**
+- Clients SHOULD retry on `500`, `502`, `503`, `504` status codes
+- Clients SHOULD implement exponential backoff with jitter
+- Recommended retry strategy: 3 attempts with delays of 1s, 2s, 4s (+ random jitter up to 500ms)
+- Clients SHOULD respect `Retry-After` header when present
+- Clients SHALL NOT retry on `4xx` errors (except `429`)
+
+**Server-Side Retries (Outbound Operations):**
+
+*GitHub API Calls:*
+- Retry attempts: 3
+- Initial delay: 1 second
+- Backoff multiplier: 2x with jitter
+- Maximum delay: 10 seconds
+- Retry on: Network errors, 500, 502, 503, 504, GitHub rate limit (after waiting)
+- Circuit breaker: Open after 5 consecutive failures, half-open after 60 seconds
+
+*Webhook Deliveries:*
+- Retry attempts: 3
+- Initial delay: 10 seconds
+- Backoff multiplier: 2x
+- Maximum delay: 5 minutes
+- Retry on: Network errors, timeouts, 500, 502, 503, 504
+- Do NOT retry on: 400, 401, 403, 404, 410 (client errors indicate configuration issue)
+
+*Database Operations:*
+- Retry attempts: 2 (for transient connection failures only)
+- Initial delay: 500ms
+- Retry on: Connection failures, deadlocks, timeout errors
+- Do NOT retry on: Constraint violations, syntax errors
+
+**FR-5.5:** The system SHALL implement request idempotency for write operations:
+- Clients MAY include `Idempotency-Key` header (UUID format) on POST/PUT requests
+- System SHALL store idempotency keys with operation results for 24 hours
+- Duplicate requests with same idempotency key SHALL return cached result (200/201) without re-executing operation
+- Idempotency SHALL apply to: PRD creation, PRD approval/rejection, webhook registration
+
+**FR-5.6:** The system SHALL implement circuit breaker pattern for external dependencies:
+- GitHub API integration SHALL use circuit breaker (threshold: 5 failures, timeout: 60s, half-open test: 1 request)
+- Webhook delivery SHALL track per-endpoint failure rates and disable webhooks with >80% failure rate over 1 hour
+- Circuit breaker state changes SHALL trigger alerts
+
+**FR-5.7:** The system SHALL implement graceful degradation:
+- Dashboard SHALL display cached metrics if real-time data unavailable (with staleness indicator)
+- API SHALL return partial results with warning if non-critical dependencies fail
+- Webhook delivery failures SHALL NOT block API responses (asynchronous processing)
+
+**FR-5.8:** The system SHALL log all errors with:
+- Request ID for correlation
+- Stack trace for 500-level errors (not exposed to clients)
+- User/client identifier (if authenticated)
+- Endpoint and method
+- Input parameters (sanitized, excluding sensitive data)
+- Error code and message
+- Timestamp
+
+**FR-5.9:** The system SHALL implement timeout policies:
+- API request timeout: 30 seconds (overall request processing)
+- Database query timeout: 10 seconds
+- GitHub API call timeout: 15 seconds
+- Webhook delivery timeout: 10 seconds
+- Background job timeout: 5 minutes
+
+**FR-5.10:** The system SHALL provide a health check endpoint (`GET /health`) returning:
+- Overall system status (healthy, degraded, unhealthy)
+- Component-level status: database, Redis, GitHub API, background jobs
+- Response time: <1 second
+- Status codes: 200 (healthy), 503 (unhealthy/degraded)
+
+**FR-5.11:** The system SHALL implement dead letter queues (DLQ) for webhook deliveries:
+- Webhooks failing all retry attempts SHALL be moved to DLQ
+- DLQ entries SHALL be retained for 7 days
+- Administrators SHALL have API access to view, retry, or purge DLQ entries
+- DLQ SHALL trigger alerts when size exceeds threshold (50 entries)
 
 ---
 
@@ -257,6 +391,16 @@ Enable streamlined, transparent PRD approval workflows through GitHub PR mechani
 - Metrics filterable by time period and project
 - Data refreshes in real-time or near-real-time
 
+### US-5: Reliable Error Handling
+**As a** Product Manager  
+**I want** clear error messages when my API request fails  
+**So that** I can understand and fix the issue quickly  
+
+**Acceptance Criteria:**
+- Error responses include specific error code and human-readable message
+- Transient failures are retried automatically
+- Idempotent operations prevent duplicate submissions
+
 ---
 
 ## Technical Specifications
@@ -269,6 +413,8 @@ Enable streamlined, transparent PRD approval workflows through GitHub PR mechani
 - **Webhooks:** Background job queue (e.g., Bull, Celery)
 - **Dashboard:** React or Vue.js with WebSocket/SSE for real-time updates
 - **Monitoring:** Prometheus + Grafana or equivalent
+- **Circuit Breaker:** Resilience library (e.g., `opossum`, `pybreaker`)
+- **Caching:** Redis for idempotency keys and circuit breaker state
 
 ### API Endpoints (Examples)
 
@@ -289,11 +435,17 @@ Enable streamlined, transparent PRD approval workflows through GitHub PR mechani
 - `GET /api/v1/webhooks` - List webhooks
 - `PUT /api/v1/webhooks/:id` - Update webhook
 - `DELETE /api/v1/webhooks/:id` - Delete webhook
+- `GET /api/v1/webhooks/dlq` - View dead letter queue
+- `POST /api/v1/webhooks/dlq/:id/retry` - Retry DLQ entry
 
 **Metrics:**
 - `GET /api/v1/metrics/pipeline` - Pipeline metrics
 - `GET /api/v1/metrics/api` - API usage metrics
 - `GET /api/v1/metrics/webhooks` - Webhook delivery metrics
+
+**System:**
+- `GET /health` - System health check
+- `GET /api/v1/rate-limits` - Current rate limit status
 
 ### Database Schema (High-Level)
 
@@ -307,16 +459,25 @@ Enable streamlined, transparent PRD approval workflows through GitHub PR mechani
 - id, client_id, access_token, refresh_token, expires_at, scopes
 
 **Webhooks:**
-- id, user_id, url, secret, events[], active, created_at
+- id, user_id, url, secret, events[], active, created_at, failure_count, disabled_at
 
 **PRDs:**
 - id, ticket_key, pr_url, status, submitted_at, approved_at, rejected_at
 
 **RateLimitTracking:**
-- client_id, window_start, request_count
+- client_id, endpoint, window_start, request_count
 
 **WebhookDeliveries:**
-- id, webhook_id, event_type, status, response_code, delivered_at
+- id, webhook_id, event_type, status, response_code, delivered_at, retry_count
+
+**WebhookDLQ:**
+- id, webhook_id, event_type, payload, failed_at, last_error, retry_count
+
+**IdempotencyKeys:**
+- key, endpoint, response_body, response_code, created_at, expires_at
+
+**ErrorLogs:**
+- id, request_id, error_code, message, stack_trace, user_id, endpoint, created_at
 
 ---
 
@@ -326,11 +487,13 @@ Enable streamlined, transparent PRD approval workflows through GitHub PR mechani
 - **GitHub App or OAuth App:** Authenticate with GitHub to create PRs and listen for PR events
 - **Webhooks:** Subscribe to PR events (opened, closed, review_requested, etc.)
 - **API:** Use GitHub API to create branches, files, and PRs in proposals repository
+- **Error Handling:** Implement circuit breaker for GitHub API rate limits and outages
 
 ### Jira Integration (Based on Context)
 - **Ticket Creation:** Link PRD to Jira ticket (MGMT-24587 pattern)
 - **Status Updates:** Update Jira ticket status when PRD is approved/rejected
 - **Comments:** Post PRD PR link to Jira ticket as comment
+- **Retry Logic:** Implement retry mechanism for transient Jira API failures
 
 ---
 
@@ -357,6 +520,12 @@ Enable streamlined, transparent PRD approval workflows through GitHub PR mechani
    - SQL injection prevention
    - XSS protection in dashboard
 
+5. **Error Handling Security:**
+   - Never expose sensitive data in error messages
+   - Sanitize stack traces before logging
+   - Prevent error-based enumeration attacks
+   - Rate limit authentication endpoints to prevent brute force
+
 ---
 
 ## Privacy and Compliance
@@ -364,6 +533,7 @@ Enable streamlined, transparent PRD approval workflows through GitHub PR mechani
 - **Data Retention:** Define retention policy for logs, metrics, and webhook delivery records (recommended: 90 days)
 - **PII Handling:** Ensure user emails and identifiers are handled per GDPR/privacy requirements
 - **Audit Logging:** Maintain audit trail for all PRD approvals and rejections
+- **Error Log Retention:** Error logs retained for 90 days, DLQ entries for 7 days
 
 ---
 
@@ -374,6 +544,8 @@ Enable streamlined, transparent PRD approval workflows through GitHub PR mechani
 3. Should the dashboard support custom metrics/queries, or fixed set of metrics?
 4. Are there specific compliance requirements (SOC2, HIPAA) that need to be addressed?
 5. Should rate limits differentiate between read and write operations?
+6. Should idempotency key retention be configurable beyond 24 hours?
+7. What alert channels should be used for circuit breaker state changes and DLQ threshold violations?
 
 ---
 
@@ -381,14 +553,16 @@ Enable streamlined, transparent PRD approval workflows through GitHub PR mechani
 
 ### Dependencies
 - GitHub API availability for PR workflow
-- Redis for distributed rate limiting (if horizontally scaled)
+- Redis for distributed rate limiting, circuit breaker state, and idempotency keys (if horizontally scaled)
 - SMTP or notification service for email alerts (optional)
+- Background job queue for asynchronous webhook delivery
 
 ### Assumptions
 - Users have GitHub accounts for PR-based approval
 - Reviewers are comfortable with GitHub PR review interface
 - HTTPS infrastructure is available for webhook endpoints
 - Monitoring infrastructure exists (Prometheus/Grafana or equivalent)
+- Webhook consumers can implement signature verification
 
 ---
 
@@ -396,11 +570,13 @@ Enable streamlined, transparent PRD approval workflows through GitHub PR mechani
 
 | Risk | Impact | Probability | Mitigation |
 |------|--------|-------------|------------|
-| GitHub API rate limits | High | Medium | Implement caching, use GitHub App for higher limits |
-| Webhook delivery failures | Medium | Medium | Implement retry logic with exponential backoff, monitoring |
+| GitHub API rate limits | High | Medium | Implement caching, use GitHub App for higher limits, circuit breaker |
+| Webhook delivery failures | Medium | Medium | Implement retry logic with exponential backoff, DLQ, monitoring, circuit breaker |
 | OAuth2 token leakage | High | Low | Short-lived tokens, encryption, secure storage, revocation |
 | Database bottleneck for metrics | Medium | Low | Implement time-series database (InfluxDB, TimescaleDB) |
 | Rate limiting bypass | Medium | Low | Use distributed cache (Redis), monitor for anomalies |
+| Cascade failures from GitHub outages | High | Low | Circuit breaker pattern, graceful degradation, cached data |
+| Duplicate PRD submissions | Medium | Medium | Idempotency key support, client-side deduplication |
 
 ---
 
@@ -408,26 +584,34 @@ Enable streamlined, transparent PRD approval workflows through GitHub PR mechani
 
 **Phase 1: Authentication & Rate Limiting (Weeks 1-2)**
 - OAuth2 implementation
-- Rate limiting middleware
+- Rate limiting middleware with endpoint-specific limits
 - Basic API endpoints
+- Error handling framework and standardized responses
 
 **Phase 2: Webhook System (Weeks 3-4)**
 - Webhook registration API
 - Event processing and delivery
-- Retry logic and monitoring
+- Retry logic with exponential backoff
+- Dead letter queue implementation
+- Webhook monitoring
 
 **Phase 3: GitHub PR Integration (Weeks 5-6)**
 - GitHub App/OAuth setup
 - PR creation workflow
 - Event subscription and processing
+- Circuit breaker for GitHub API
+- Error handling for GitHub integration
 
 **Phase 4: Dashboard (Weeks 7-8)**
 - Dashboard UI development
 - Real-time metrics implementation
 - Export functionality
+- Graceful degradation for metrics unavailability
 
 **Phase 5: Testing & Launch (Week 9)**
 - Integration testing
+- Error scenario testing (retries, circuit breaker, DLQ)
+- Load testing for rate limits
 - Security audit
 - Production deployment
 
@@ -441,16 +625,61 @@ Enable streamlined, transparent PRD approval workflows through GitHub PR mechani
 - **HMAC:** Hash-based Message Authentication Code
 - **JWT:** JSON Web Token
 - **CORS:** Cross-Origin Resource Sharing
+- **DLQ:** Dead Letter Queue - storage for messages that cannot be processed
+- **Circuit Breaker:** Design pattern preventing cascading failures by detecting failures and encapsulating logic to prevent repeated calls
+- **Idempotency:** Property ensuring that multiple identical requests have the same effect as a single request
+
+### Error Code Reference
+
+**Authentication Errors:**
+- `AUTH_TOKEN_MISSING` - No authentication token provided
+- `AUTH_TOKEN_INVALID` - Token signature invalid or malformed
+- `AUTH_TOKEN_EXPIRED` - Token has passed expiration time
+- `AUTH_INVALID_SCOPE` - Token lacks required scope for operation
+- `AUTH_INVALID_CREDENTIALS` - Invalid client credentials
+
+**Rate Limiting Errors:**
+- `RATE_LIMIT_EXCEEDED` - Request rate limit exceeded for endpoint
+- `RATE_QUOTA_EXHAUSTED` - Tier-wide quota exhausted
+
+**Validation Errors:**
+- `VALIDATION_REQUIRED_FIELD` - Required field missing
+- `VALIDATION_INVALID_FORMAT` - Field format invalid
+- `VALIDATION_INVALID_URL` - Invalid URL format (webhooks)
+
+**Resource Errors:**
+- `RESOURCE_NOT_FOUND` - Requested resource does not exist
+- `RESOURCE_CONFLICT` - Duplicate resource or state conflict
+- `RESOURCE_FORBIDDEN` - Access to resource forbidden
+
+**Webhook Errors:**
+- `WEBHOOK_DELIVERY_FAILED` - Webhook delivery failed after retries
+- `WEBHOOK_TIMEOUT` - Webhook endpoint timeout
+- `WEBHOOK_INVALID_RESPONSE` - Invalid response from webhook endpoint
+
+**GitHub Integration Errors:**
+- `GITHUB_API_ERROR` - Generic GitHub API error
+- `GITHUB_RATE_LIMIT` - GitHub API rate limit exceeded
+- `GITHUB_AUTH_FAILED` - GitHub authentication failed
+- `GITHUB_PR_CREATE_FAILED` - Failed to create pull request
+
+**Internal Errors:**
+- `INTERNAL_DATABASE_ERROR` - Database operation failed
+- `INTERNAL_SERVICE_ERROR` - Internal service error
+- `INTERNAL_TIMEOUT` - Internal operation timeout
 
 ### References
 - [OAuth 2.0 RFC 6749](https://tools.ietf.org/html/rfc6749)
 - [GitHub API Documentation](https://docs.github.com/en/rest)
 - [Webhook Best Practices](https://webhooks.fyi/)
 - [Rate Limiting Patterns](https://cloud.google.com/architecture/rate-limiting-strategies-techniques)
+- [Circuit Breaker Pattern](https://martinfowler.com/bliki/CircuitBreaker.html)
+- [HTTP Status Codes](https://httpstatuses.com/)
+- [API Error Handling Best Practices](https://www.rfc-editor.org/rfc/rfc7807)
 
 ---
 
-**Document Version:** 1.0  
+**Document Version:** 2.0  
 **Last Updated:** 2026-06-14  
 **Owner:** Product Team  
 **Approvers:** Engineering Lead, Security Team
